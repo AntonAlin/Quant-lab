@@ -35,6 +35,16 @@ pip install -e .
 streamlit run quantlab/app.py
 ```
 
+Or double-click a launcher: `scripts/run_quantlab.bat` (Windows), `scripts/run_quantlab.command` (macOS), `scripts/run_quantlab.sh` (Linux). They use the repo's `.venv` if one exists and open the browser themselves.
+
+To get a desktop shortcut, run once from the repo:
+
+```bash
+python scripts/make_shortcut.py
+```
+
+It creates `QuantLab.lnk` (Windows), `QuantLab.command` (macOS) or `QuantLab.desktop` (Linux) on your desktop, pointing at the launcher above.
+
 Tests:
 
 ```bash
