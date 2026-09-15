@@ -33,7 +33,7 @@ class VotingAdapter(ModelAdapter):
     def get_params(self) -> dict[str, Any]:
         return {"family": f"voting_{self.method}", "members": [m.get_params() for m in self.members]}
 
-    def param_distributions(self, rng: np.random.Generator) -> dict[str, Any]:
+    def suggest_params(self, trial: Any) -> dict[str, Any]:
         return {}
 
     def fit(self, X: pd.DataFrame, y: pd.Series, sample_weight: pd.Series | None = None, progress: ProgressFn | None = None) -> "VotingAdapter":
@@ -44,16 +44,17 @@ class VotingAdapter(ModelAdapter):
         self.fitted_ = True
         return self
 
-    def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
+    def predict_proba(self, X: pd.DataFrame, context: pd.DataFrame | None = None) -> pd.DataFrame:
         self._check_fitted()
-        frames = [m.predict_proba(X).reindex(columns=[int(c) for c in self.classes_]).fillna(0.0) for m in self.members]
+        raw = [m.predict_proba(X, context) for m in self.members]
+        frames = [r.reindex(columns=[int(c) for c in self.classes_]).fillna(0.0) for r in raw]
         if self.method == "soft":
             avg = sum(frames) / len(frames)
         else:
             votes = [pd.get_dummies(f.idxmax(axis=1)).reindex(columns=[int(c) for c in self.classes_], fill_value=0).astype(float) for f in frames]
             avg = sum(votes) / len(votes)
         # Rows nobody could score (sequence warm-up) should stay NaN, not 0.
-        unscored = np.logical_and.reduce([m.predict_proba(X).isna().all(axis=1).to_numpy() for m in self.members])
+        unscored = np.logical_and.reduce([r.isna().all(axis=1).to_numpy() for r in raw])
         avg.loc[unscored, :] = np.nan
         row_sum = avg.sum(axis=1).replace(0, np.nan)
         return avg.div(row_sum, axis=0)
@@ -75,7 +76,7 @@ class StackingAdapter(ModelAdapter):
     def get_params(self) -> dict[str, Any]:
         return {"family": "stacking", "n_inner_folds": self.n_inner_folds, "members": [m.get_params() for m in self.members]}
 
-    def param_distributions(self, rng: np.random.Generator) -> dict[str, Any]:
+    def suggest_params(self, trial: Any) -> dict[str, Any]:
         return {}
 
     def fit(self, X: pd.DataFrame, y: pd.Series, sample_weight: pd.Series | None = None, progress: ProgressFn | None = None) -> "StackingAdapter":
@@ -99,7 +100,8 @@ class StackingAdapter(ModelAdapter):
                     mm.fit(X.iloc[tr], y.iloc[tr], None if sample_weight is None else sample_weight.iloc[tr], None)
                 except ValueError:
                     continue  # too few rows / single class in an early block: skip, the OOF row stays NaN
-                oof[j].iloc[te] = mm.predict_proba(X.iloc[te]).reindex(columns=cols).to_numpy()
+                ctx = X.iloc[max(0, bounds[k] - 500) : bounds[k]]
+                oof[j].iloc[te] = mm.predict_proba(X.iloc[te], ctx).reindex(columns=cols).to_numpy()
         Z = pd.concat(oof, axis=1)
         ok = Z.notna().all(axis=1).to_numpy() & ~np.isnan(yv)
         if ok.sum() < 30:
@@ -114,10 +116,10 @@ class StackingAdapter(ModelAdapter):
         self.fitted_ = True
         return self
 
-    def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
+    def predict_proba(self, X: pd.DataFrame, context: pd.DataFrame | None = None) -> pd.DataFrame:
         self._check_fitted()
         cols = [int(c) for c in self.classes_]
-        Z = pd.concat([m.predict_proba(X).reindex(columns=cols) for m in self.members], axis=1)
+        Z = pd.concat([m.predict_proba(X, context).reindex(columns=cols) for m in self.members], axis=1)
         ok = Z.notna().all(axis=1).to_numpy()
         out = pd.DataFrame(np.nan, index=X.index, columns=cols, dtype=float)
         if ok.any():

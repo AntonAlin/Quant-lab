@@ -53,9 +53,10 @@ class SklearnAdapter(ModelAdapter):
         self.fitted_ = True
         return self
 
-    def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
+    def predict_proba(self, X: pd.DataFrame, context: pd.DataFrame | None = None) -> pd.DataFrame:
         self._check_fitted()
         self._check_columns(X)
+        # Row-wise models do not care about history; context is accepted for interface parity.
         valid = ~X.isna().all(axis=1).to_numpy()
         proba = self.pipeline_.predict_proba(X.loc[valid]) if valid.any() else np.zeros((0, len(self.classes_)))
         return self._proba_frame(X.index, proba, valid)
@@ -100,8 +101,8 @@ class LogRegAdapter(SklearnAdapter):
             random_state=self.seed,
         )
 
-    def param_distributions(self, rng: np.random.Generator) -> dict[str, Any]:
-        return {"C": float(10 ** rng.uniform(-3, 2)), "l1_ratio": float(rng.choice([0.0, 0.25, 0.5, 0.75, 1.0]))}
+    def suggest_params(self, trial: Any) -> dict[str, Any]:
+        return {"C": trial.suggest_float("C", 1e-3, 1e2, log=True), "l1_ratio": trial.suggest_categorical("l1_ratio", [0.0, 0.25, 0.5, 0.75, 1.0])}
 
 
 class RandomForestAdapter(SklearnAdapter):
@@ -129,11 +130,11 @@ class RandomForestAdapter(SklearnAdapter):
             random_state=self.seed,
         )
 
-    def param_distributions(self, rng: np.random.Generator) -> dict[str, Any]:
+    def suggest_params(self, trial: Any) -> dict[str, Any]:
         return {
-            "max_depth": int(rng.integers(2, 12)),
-            "min_samples_leaf": int(rng.choice([5, 10, 20, 50, 100])),
-            "max_features": str(rng.choice(["sqrt", "log2", "0.5"])),
+            "max_depth": trial.suggest_int("max_depth", 2, 12),
+            "min_samples_leaf": trial.suggest_categorical("min_samples_leaf", [5, 10, 20, 50, 100]),
+            "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", "0.5"]),
         }
 
 
@@ -188,14 +189,14 @@ class XGBoostAdapter(SklearnAdapter):
             verbosity=0,
         )
 
-    def param_distributions(self, rng: np.random.Generator) -> dict[str, Any]:
+    def suggest_params(self, trial: Any) -> dict[str, Any]:
         return {
-            "max_depth": int(rng.integers(2, 8)),
-            "learning_rate": float(10 ** rng.uniform(-2.5, -0.7)),
-            "subsample": float(rng.uniform(0.5, 1.0)),
-            "colsample_bytree": float(rng.uniform(0.5, 1.0)),
-            "min_child_weight": float(rng.choice([1, 5, 10, 20])),
-            "reg_lambda": float(10 ** rng.uniform(-1, 1.5)),
+            "max_depth": trial.suggest_int("max_depth", 2, 8),
+            "learning_rate": trial.suggest_float("learning_rate", 3e-3, 0.2, log=True),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "min_child_weight": trial.suggest_categorical("min_child_weight", [1.0, 5.0, 10.0, 20.0]),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 30.0, log=True),
         }
 
 
@@ -233,13 +234,13 @@ class LightGBMAdapter(SklearnAdapter):
             verbose=-1,
         )
 
-    def param_distributions(self, rng: np.random.Generator) -> dict[str, Any]:
+    def suggest_params(self, trial: Any) -> dict[str, Any]:
         return {
-            "num_leaves": int(rng.choice([7, 15, 31, 63])),
-            "learning_rate": float(10 ** rng.uniform(-2.5, -0.7)),
-            "subsample": float(rng.uniform(0.5, 1.0)),
-            "colsample_bytree": float(rng.uniform(0.5, 1.0)),
-            "min_child_samples": int(rng.choice([10, 20, 50, 100])),
+            "num_leaves": trial.suggest_categorical("num_leaves", [7, 15, 31, 63]),
+            "learning_rate": trial.suggest_float("learning_rate", 3e-3, 0.2, log=True),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "min_child_samples": trial.suggest_categorical("min_child_samples", [10, 20, 50, 100]),
         }
 
 

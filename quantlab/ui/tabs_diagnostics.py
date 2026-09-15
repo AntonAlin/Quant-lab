@@ -6,7 +6,7 @@ import numpy as np
 import streamlit as st
 
 from quantlab.data.calendar import bars_per_year
-from quantlab.diagnostics import calibration, confusion, per_regime_performance, permutation_importance_oos, probability_by_class, shap_values_last_fold
+from quantlab.diagnostics import calibration, confusion, per_regime_performance, permutation_importance_oos, probability_by_class, shap_last_fold
 from quantlab.ui import plots
 from quantlab.ui.state import cfg
 
@@ -34,16 +34,22 @@ def render() -> None:
             if neg:
                 st.caption(f"Shuffling these *improved* OOS log-loss, i.e. they are noise the model latched on to: {', '.join(neg[:8])}")
     with c2:
-        try:
-            out = shap_values_last_fold(ds, wf)
-        except Exception as e:  # noqa: BLE001 - shap is fragile across versions; degrade, do not crash the tab
-            out = None
-            st.caption(f"SHAP unavailable: {e}")
-        if out is None:
-            st.caption("SHAP is shown for tree models (random forest, extra trees, XGBoost, LightGBM).")
-        else:
-            shap_df, X_used = out
-            st.plotly_chart(plots.shap_beeswarm(shap_df, X_used), use_container_width=True)
+        if st.button("Compute SHAP (last fold, OOS)"):
+            try:
+                with st.spinner("Explaining the last fold..."):
+                    st.session_state["shap_blocks"] = shap_last_fold(ds, wf)
+            except Exception as e:  # noqa: BLE001 - shap is fragile across versions; degrade, do not crash the tab
+                st.session_state["shap_blocks"] = []
+                st.error(f"SHAP failed: {e}")
+        blocks = st.session_state.get("shap_blocks")
+        if blocks:
+            names = [b.component for b in blocks]
+            pick = st.selectbox("Component", names) if len(names) > 1 else names[0]
+            blk = blocks[names.index(pick)]
+            st.plotly_chart(plots.shap_beeswarm(blk.values, blk.X, scale=blk.scale), use_container_width=True)
+            st.caption(f"SHAP values are on the {blk.scale} scale. Sequence models: each value is the sum over the lookback window.")
+        elif blocks is not None:
+            st.caption("Nothing explainable in this model.")
 
     st.subheader("Classification quality (OOS)")
     c3, c4 = st.columns(2)

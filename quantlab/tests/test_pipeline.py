@@ -43,9 +43,9 @@ def test_other_families_run(ohlcv: pd.DataFrame, family: str, params: dict) -> N
     wf = run_walkforward(ds, cfg)
     assert len(wf.folds) >= 3
     if family == "gru":
-        # First seq_len-1 bars of every test fold carry no prediction, by design.
-        first = wf.folds[0].oos
-        assert first["p_long"].iloc[:9].isna().all() and first["p_long"].iloc[9:].notna().all()
+        # Pre-test context feeds the first windows, so every test bar is scored.
+        assert wf.oos["p_long"].notna().all()
+        assert wf.folds[0].context_start is not None and wf.folds[0].context_start < wf.folds[0].test_start
 
 
 def test_meta_and_ensemble_paths(ohlcv: pd.DataFrame) -> None:
@@ -74,11 +74,64 @@ def test_store_and_leaderboard(ohlcv: pd.DataFrame, tmp_path: Path) -> None:
             store.log_run(rec, ev.backtest.returns)
     runs = store.load_runs()
     assert len(runs) == 2 and store.n_trials("SYNTH") == 2
+    assert runs["ret_skew"].notna().all() and (runs["ret_kurtosis"] > 0).all()
     lb = leaderboard(store)
     assert "dsr_now" in lb and lb["n_trials_now"].iloc[0] == 2
+    # The recomputed DSR must use the stored moments, not a normal approximation.
+    from quantlab.backtest.metrics import expected_max_sharpe, probabilistic_sharpe
+
+    row = lb.iloc[0]
+    sr0 = expected_max_sharpe(2, float(runs["sharpe_per_bar"].var(ddof=1)))
+    want = probabilistic_sharpe(row["sharpe_per_bar"] if "sharpe_per_bar" in row else runs.set_index("run_id").loc[row["run_id"], "sharpe_per_bar"], sr0, int(row["m_n_bars"]), float(row["ret_skew"]), float(row["ret_kurtosis"]))
+    assert row["dsr_now"] == pytest.approx(want)
     pbo = pbo_across_runs(store, lb["run_id"].tolist(), n_partitions=4)
     assert 0 <= pbo.pbo <= 1
     assert store.load_returns(lb["run_id"].iloc[0]) is not None
+
+
+def test_context_must_precede_x(ohlcv: pd.DataFrame) -> None:
+    from quantlab.models import build_model
+
+    cfg = _cfg("gru", params={"epochs": 1, "seq_len": 5})
+    ds = prepare_dataset(ohlcv, cfg)
+    m = build_model(cfg.model, 0).fit(ds.X.iloc[:400], ds.y.iloc[:400])
+    ok = m.predict_proba(ds.X.iloc[400:450], ds.X.iloc[380:400])
+    assert ok.notna().all().all()
+    with pytest.raises(ValueError, match="future"):
+        m.predict_proba(ds.X.iloc[400:450], ds.X.iloc[410:420])
+    # Without context the first seq_len-1 rows are honestly unscored, not silently filled.
+    assert m.predict_proba(ds.X.iloc[400:450])[1].iloc[:4].isna().all()
+
+
+def test_optuna_retuning_changes_params_per_fold(ohlcv: pd.DataFrame) -> None:
+    cfg = _cfg("logreg")
+    cfg.walkforward = WalkForwardConfig(train_window=400, test_window=200, step=200, embargo=5, retune_per_fold=True, tune_iterations=3)
+    ds = prepare_dataset(ohlcv, cfg)
+    events = []
+    wf = run_walkforward(ds, cfg, progress=lambda e: events.append(e) if e.get("stage") == "tune" else None)
+    assert (wf.fold_table["tune_s"] > 0).all()
+    assert len(events) == 3 * len(wf.folds)
+    for f in wf.folds:
+        assert set(f.params_used) >= {"C", "l1_ratio"}
+    # Determinism: same seed, same tuned params.
+    wf2 = run_walkforward(ds, cfg)
+    assert [f.params_used for f in wf.folds] == [f.params_used for f in wf2.folds]
+
+
+@pytest.mark.parametrize("family,params,scale", [("logreg", {}, "log-odds"), ("extra_trees", {"n_estimators": 20}, "probability"), ("gru", {"epochs": 1, "seq_len": 8}, "logit")])
+def test_shap_covers_every_family(ohlcv: pd.DataFrame, family: str, params: dict, scale: str) -> None:
+    from quantlab.diagnostics import shap_last_fold
+
+    cfg = _cfg(family, params=params)
+    ds = prepare_dataset(ohlcv, cfg)
+    wf = run_walkforward(ds, cfg)
+    blocks = shap_last_fold(ds, wf, max_rows=60)
+    assert len(blocks) == 1
+    b = blocks[0]
+    assert scale in b.scale
+    assert list(b.values.columns) == ds.feature_columns
+    assert b.values.index.equals(b.X.index) and len(b.values) > 0
+    assert np.isfinite(b.values.to_numpy()).all()
 
 
 def test_dsr_penalises_trials() -> None:

@@ -45,7 +45,7 @@ def render() -> None:
     if not M.ensemble.enabled:
         M.family = st.selectbox("Family", CLASSICAL + DEEP, index=(CLASSICAL + DEEP).index(M.family))
         if M.family in DEEP:
-            st.caption("Sequence models window inside each fold. The first seq_len-1 bars of every test fold get no prediction and sit flat.")
+            st.caption("Sequence models train on windows built inside the train fold only. At test time they look back over the bars just before the fold (train tail + embargo) as history, so every test bar gets a prediction.")
         M.params = _params_editor(M.family, M.params, "mp")
     else:
         E = M.ensemble
@@ -92,10 +92,10 @@ def render() -> None:
             W.i_know_what_i_am_doing = st.checkbox("I know what I am doing (run anyway)", W.i_know_what_i_am_doing)
     else:
         W.i_know_what_i_am_doing = False
-    W.retune_per_fold = st.checkbox("Re-tune hyperparameters inside every fold (random search on the fold's own tail)", W.retune_per_fold)
+    W.retune_per_fold = st.checkbox("Re-tune hyperparameters inside every fold (Optuna TPE on the fold's own tail)", W.retune_per_fold)
     if W.retune_per_fold:
-        W.tune_iterations = int(st.number_input("Random-search candidates per fold", 2, 100, W.tune_iterations))
-        st.caption(f"Cost: roughly {W.tune_iterations}x the training time of a plain run. Honest, but slow.")
+        W.tune_iterations = int(st.number_input("Optuna trials per fold", 2, 200, W.tune_iterations))
+        st.caption(f"Cost: roughly {W.tune_iterations}x the training time of a plain run. Your current params are trial 0, so tuning cannot pick something worse on the tuning tail. Ensembles are not re-tuned.")
     else:
         st.caption("Fixed hyperparameters across folds: fast, and the ones above were presumably chosen while looking at this data, which is a mild form of leakage. Re-tuning per fold is the honest option.")
 
@@ -174,7 +174,9 @@ def _train(c, d: pd.DataFrame) -> None:
         elif stage == "epoch":
             epoch_box.caption(f"{ev['model']} epoch {ev['epoch']}: train loss {ev['train_loss']:.4f}, val loss {ev['val_loss']:.4f} (best {ev['best_val']:.4f})")
         elif stage == "tune":
-            epoch_box.caption(f"tuning candidate {ev['candidate']}/{ev['n_candidates']}: val log-loss {ev['val_logloss']:.4f}")
+            epoch_box.caption(f"optuna trial {ev['candidate']}/{ev['n_candidates']}: val log-loss {ev['val_logloss']:.4f}")
+        elif stage == "tune_skip":
+            epoch_box.caption(f"tuning skipped: {ev['reason']}")
 
     try:
         with status:

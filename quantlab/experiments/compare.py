@@ -19,7 +19,7 @@ LEADERBOARD_COLS = [
     "wf_mode", "wf_train", "wf_test", "wf_embargo", "sizing", "direction",
     "m_sharpe", "dsr_now", "m_cagr", "m_max_drawdown", "m_calmar", "m_sortino", "m_hit_rate", "m_profit_factor",
     "m_n_trades", "m_turnover_annual", "m_avg_exposure", "oos_accuracy", "oos_logloss", "random_percentile",
-    "m_bench_sharpe", "n_trials_at_run", "config_hash", "session_id",
+    "m_bench_sharpe", "ret_skew", "ret_kurtosis", "sharpe_per_bar", "m_n_bars", "n_trials_at_run", "config_hash", "session_id",
 ]
 
 
@@ -38,12 +38,13 @@ def leaderboard(store: ExperimentStore, ticker: str | None = None, interval: str
     n = len(trials)
     var = float(trials["sharpe_per_bar"].var(ddof=1)) if n > 1 else 0.0
     sr0 = expected_max_sharpe(n, var)
-    # Recompute DSR with today's trial count. Skew/kurt per run are not stored, so
-    # we approximate with the normal case (skew 0, kurt 3): slightly generous on
-    # fat tails, but consistent across rows, which is what a leaderboard needs.
+    # Recompute DSR with today's trial count, using each run's own return skew and
+    # kurtosis. Rows logged before those columns existed fall back to normal moments.
+    skew = runs["ret_skew"] if "ret_skew" in runs else pd.Series(0.0, index=runs.index)
+    kurt = runs["ret_kurtosis"] if "ret_kurtosis" in runs else pd.Series(3.0, index=runs.index)
     runs["dsr_now"] = [
-        probabilistic_sharpe(sr, sr0, int(nb), 0.0, 3.0) if np.isfinite(sr) else np.nan
-        for sr, nb in zip(runs["sharpe_per_bar"], runs["m_n_bars"])
+        probabilistic_sharpe(sr, sr0, int(nb), float(sk) if np.isfinite(sk) else 0.0, float(ku) if np.isfinite(ku) else 3.0) if np.isfinite(sr) else np.nan
+        for sr, nb, sk, ku in zip(runs["sharpe_per_bar"], runs["m_n_bars"], skew, kurt)
     ]
     runs["n_trials_now"] = n
     cols = [c for c in LEADERBOARD_COLS if c in runs.columns] + ["n_trials_now"]

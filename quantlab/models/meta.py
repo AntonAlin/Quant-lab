@@ -67,20 +67,24 @@ class MetaLabelingAdapter(ModelAdapter):
             "secondary": self.secondary.get_params(),
         }
 
-    def param_distributions(self, rng: np.random.Generator) -> dict[str, Any]:
+    def suggest_params(self, trial: Any) -> dict[str, Any]:
         return {}
 
-    def _sides(self, X: pd.DataFrame, fit: bool, y: pd.Series | None = None, w: pd.Series | None = None, progress: ProgressFn | None = None) -> tuple[pd.DataFrame, pd.Series]:
+    @staticmethod
+    def _strip(df: pd.DataFrame | None) -> pd.DataFrame | None:
+        return None if df is None else df.drop(columns=[SIDE_COL], errors="ignore")
+
+    def _sides(self, X: pd.DataFrame, fit: bool, y: pd.Series | None = None, w: pd.Series | None = None, progress: ProgressFn | None = None, context: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.Series]:
         if self.primary is None:
             if SIDE_COL not in X.columns:
                 raise ValueError(f"Meta-labeling with a rule primary needs column {SIDE_COL!r} in X. The pipeline injects it.")
             side = X[SIDE_COL].fillna(0.0)
             return X.drop(columns=[SIDE_COL]), side
-        Xf = X.drop(columns=[SIDE_COL], errors="ignore")
+        Xf = self._strip(X)
         if fit:
             assert y is not None
             self.primary.fit(Xf, y, w, progress)
-        proba = self.primary.predict_proba(Xf)
+        proba = self.primary.predict_proba(Xf, self._strip(context))
         p_long = proba[1] if 1 in proba.columns else pd.Series(0.0, index=X.index)
         p_short = proba[-1] if -1 in proba.columns else 1.0 - p_long
         side = pd.Series(0.0, index=X.index)
@@ -107,17 +111,17 @@ class MetaLabelingAdapter(ModelAdapter):
         self.fitted_ = True
         return self
 
-    def predict_meta(self, X: pd.DataFrame) -> pd.DataFrame:
+    def predict_meta(self, X: pd.DataFrame, context: pd.DataFrame | None = None) -> pd.DataFrame:
         """side in {-1,0,1} and P(take the trade). This is what the backtest wants."""
         self._check_fitted()
-        Xf, side = self._sides(X, fit=False)
-        proba = self.secondary.predict_proba(Xf)
+        Xf, side = self._sides(X, fit=False, context=context)
+        proba = self.secondary.predict_proba(Xf, self._strip(context))
         p_trade = proba[1] if 1 in proba.columns else pd.Series(np.nan, index=X.index)
         return pd.DataFrame({"side": side, "p_trade": p_trade})
 
-    def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
+    def predict_proba(self, X: pd.DataFrame, context: pd.DataFrame | None = None) -> pd.DataFrame:
         """Directional view for diagnostics: P(long) = p_trade when side=+1, etc."""
-        m = self.predict_meta(X)
+        m = self.predict_meta(X, context)
         out = pd.DataFrame(np.nan, index=X.index, columns=[-1, 1], dtype=float)
         p = m["p_trade"]
         out[1] = np.where(m["side"] > 0, p, np.where(m["side"] < 0, 1 - p, 0.5))

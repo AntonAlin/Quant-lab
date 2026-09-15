@@ -115,6 +115,7 @@ class FoldResult:
     insample: pd.DataFrame  # per train bar: y_true, p_*, y_pred (greyed in UI)
     fit_seconds: float
     tune_seconds: float = 0.0
+    context_start: pd.Timestamp | None = None
     train_accuracy: float = np.nan
     test_accuracy: float = np.nan
     test_logloss: float = np.nan
@@ -152,45 +153,80 @@ def _proba_to_frame(proba: pd.DataFrame, y_true: pd.Series, classes: list[int], 
     return out
 
 
-def _tune(model_cfg: ModelConfig, X: pd.DataFrame, y: pd.Series, w: pd.Series, seed: int, n_iter: int, gap: int, progress: ProgressFn | None) -> tuple[dict[str, Any], float]:
-    """Random search on the chronological tail of the train fold. Honest, slow, optional."""
+CONTEXT_BARS = 500  # pre-test history handed to sequence models; they take the last seq_len-1 rows
+
+
+def _tune(model_cfg: ModelConfig, X: pd.DataFrame, y: pd.Series, w: pd.Series, seed: int, n_trials: int, gap: int, progress: ProgressFn | None) -> tuple[dict[str, Any], float]:
+    """Optuna TPE search on the chronological tail of the train fold. Honest, slow, optional.
+
+    Objective: log-loss on the last 20% of the fold, with `gap` bars of embargo
+    between the tuning-train and tuning-validation slices so overlapping labels
+    do not leak inside the tuner either. The user's own params are trial 0, so
+    the search can never do worse than not searching.
+    """
+    import optuna
+
     t0 = time.time()
-    base = build_model(model_cfg, seed)
-    if isinstance(base, ModelAdapter) and not hasattr(base, "param_distributions"):
+    if model_cfg.ensemble.enabled:
+        if progress:
+            progress({"stage": "tune_skip", "reason": "ensembles are not re-tuned per fold; tune the members individually first"})
         return dict(model_cfg.params), 0.0
-    rng = np.random.default_rng(seed)
+    probe = build_model(model_cfg, seed)
     n = len(X)
     split = int(n * 0.8)
     tr, va = slice(0, split), slice(split + gap, n)
     if n - split - gap < 30:
         return dict(model_cfg.params), 0.0
     yv = y.iloc[va]
-    candidates: list[dict[str, Any]] = [dict(model_cfg.params)]
-    for _ in range(n_iter - 1):
-        draw = base.param_distributions(rng)
+    ctx = X.iloc[max(0, split + gap - CONTEXT_BARS) : split + gap]
+
+    def objective(trial: optuna.Trial) -> float:
+        draw = probe.suggest_params(trial)
         if not draw:
-            break
-        candidates.append({**model_cfg.params, **draw})
-    best, best_loss = dict(model_cfg.params), np.inf
-    for k, cand in enumerate(candidates):
+            raise optuna.TrialPruned()
         cfg_k = copy.deepcopy(model_cfg)
-        cfg_k.params = cand
+        cfg_k.params = {**model_cfg.params, **draw}
         try:
             m = build_model(cfg_k, seed)
             m.fit(X.iloc[tr], y.iloc[tr], w.iloc[tr], None)
-            p = m.predict_proba(X.iloc[va])
-        except ValueError:
-            continue
+            p = m.predict_proba(X.iloc[va], ctx)
+        except ValueError as e:
+            raise optuna.TrialPruned() from e
         ok = p.notna().all(axis=1) & yv.notna()
         if ok.sum() < 10:
-            continue
+            raise optuna.TrialPruned()
         cls = [int(c) for c in m.classes_]
-        ll = log_loss(yv[ok].astype(int), p.loc[ok, cls].to_numpy(), labels=cls)
+        ll = float(log_loss(yv[ok].astype(int), p.loc[ok, cls].to_numpy(), labels=cls))
         if progress:
-            progress({"stage": "tune", "candidate": k + 1, "n_candidates": len(candidates), "val_logloss": ll})
-        if ll < best_loss:
-            best, best_loss = cand, ll
+            progress({"stage": "tune", "candidate": trial.number + 1, "n_candidates": n_trials, "val_logloss": ll})
+        return ll
+
+    optuna.logging.set_verbosity(optuna.logging.ERROR)
+    study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=seed, n_startup_trials=min(5, max(1, n_trials // 3))))
+    # Seed the study with the user's own params as trial 0. Only keys the search
+    # space knows about can be enqueued; the rest ride along via model_cfg.params.
+    space_keys = set(_space_keys(probe))
+    baseline = {k: v for k, v in probe.params.items() if k in space_keys}
+    if baseline:
+        study.enqueue_trial(baseline)
+    study.optimize(objective, n_trials=n_trials, catch=())
+    done = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if not done:
+        return dict(model_cfg.params), time.time() - t0
+    best = {**model_cfg.params, **study.best_params}
     return best, time.time() - t0
+
+
+def _space_keys(adapter: ModelAdapter) -> list[str]:
+    """Names the adapter's search space draws, discovered with a fixed-choice dry run."""
+    import optuna
+
+    study = optuna.create_study(sampler=optuna.samplers.RandomSampler(seed=0))
+    trial = study.ask()
+    try:
+        return list(adapter.suggest_params(trial).keys())
+    finally:
+        study.tell(trial, 0.0)
 
 
 def run_walkforward(ds: Dataset, cfg: ExperimentConfig, progress: ProgressFn | None = None) -> WalkForwardResult:
@@ -230,9 +266,12 @@ def run_walkforward(ds: Dataset, cfg: ExperimentConfig, progress: ProgressFn | N
         fold_classes = [int(c) for c in model.classes_]
         classes.update(fold_classes)
 
-        proba_te = model.predict_proba(X_te)
+        # History for sequence models: bars strictly before the test window (train + embargo).
+        te0 = int(f.test_idx[0])
+        ctx = X.iloc[max(0, te0 - CONTEXT_BARS) : te0]
+        proba_te = model.predict_proba(X_te, ctx)
         proba_tr = model.predict_proba(X_tr)
-        meta_te = model.predict_meta(X_te) if is_meta else None  # type: ignore[attr-defined]
+        meta_te = model.predict_meta(X_te, ctx) if is_meta else None  # type: ignore[attr-defined]
         meta_tr = model.predict_meta(X_tr) if is_meta else None  # type: ignore[attr-defined]
         oos = _proba_to_frame(proba_te, y_te, fold_classes, meta_te)
         ins = _proba_to_frame(proba_tr, y_tr, fold_classes, meta_tr)
@@ -259,6 +298,7 @@ def run_walkforward(ds: Dataset, cfg: ExperimentConfig, progress: ProgressFn | N
             insample=ins,
             fit_seconds=time.time() - t0 - tune_s,
             tune_seconds=tune_s,
+            context_start=ctx.index[0] if len(ctx) else None,
             train_accuracy=float((ins.loc[ok_tr, "y_pred"] == ins.loc[ok_tr, "y_true"]).mean()) if ok_tr.any() else np.nan,
             test_accuracy=float((oos.loc[ok_te, "y_pred"] == oos.loc[ok_te, "y_true"]).mean()) if ok_te.any() else np.nan,
             test_logloss=ll,
@@ -377,6 +417,8 @@ def experiment_record(cfg: ExperimentConfig, ds: Dataset, wf: WalkForwardResult,
         "seed": cfg.seed,
         "n_trials_at_run": ev.n_trials,
         "sharpe_per_bar": ev.dsr.sharpe_per_bar,
+        "ret_skew": ev.dsr.skew,
+        "ret_kurtosis": ev.dsr.kurtosis,  # non-excess, as PSR wants it
         "dsr": ev.dsr.dsr,
         "psr": ev.dsr.psr,
         "random_percentile": ev.random_bench.percentile,

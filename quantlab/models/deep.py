@@ -1,10 +1,12 @@
 """PyTorch sequence models: LSTM, GRU and a small encoder-only transformer.
 
 Windowing happens *inside* fit/predict on whatever contiguous slice the caller
-hands over. The walk-forward loop hands over the train fold and the test fold
-separately, so a window can never contain bars from both sides of the split.
-The price of that purity: the first seq_len-1 bars of every test fold get no
-prediction (NaN -> flat in the backtest). It is stated in the UI. Live with it.
+hands over. Training windows are built from the train fold only, so no training
+sequence ever contains a test bar. At predict time the caller may pass `context`:
+the rows immediately before X. Those are used purely as history for the first
+seq_len-1 windows, exactly as a live model would look back at yesterday's bars.
+They sit strictly in the past relative to every row being scored, so every test
+bar gets a prediction and nothing leaks.
 """
 
 from __future__ import annotations
@@ -99,12 +101,12 @@ class TorchSequenceAdapter(ModelAdapter):
         p = self.params
         return _RNN(self.kind, n_features, p["hidden_size"], p["num_layers"], p["dropout"], p["bidirectional"], n_classes)
 
-    def param_distributions(self, rng: np.random.Generator) -> dict[str, Any]:
+    def suggest_params(self, trial: Any) -> dict[str, Any]:
         return {
-            "hidden_size": int(rng.choice([16, 32, 64, 128])),
-            "num_layers": int(rng.integers(1, 3)),
-            "dropout": float(rng.choice([0.1, 0.2, 0.3, 0.5])),
-            "lr": float(10 ** rng.uniform(-4, -2)),
+            "hidden_size": trial.suggest_categorical("hidden_size", [16, 32, 64, 128]),
+            "num_layers": trial.suggest_int("num_layers", 1, 2),
+            "dropout": trial.suggest_categorical("dropout", [0.1, 0.2, 0.3, 0.5]),
+            "lr": trial.suggest_float("lr", 1e-4, 1e-2, log=True),
         }
 
     def fit(self, X: pd.DataFrame, y: pd.Series, sample_weight: pd.Series | None = None, progress: ProgressFn | None = None) -> "TorchSequenceAdapter":
@@ -180,20 +182,68 @@ class TorchSequenceAdapter(ModelAdapter):
         self.fitted_ = True
         return self
 
-    def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
+    def _windows_with_context(self, X: pd.DataFrame, context: pd.DataFrame | None) -> tuple[np.ndarray, int]:
+        """Preprocess context+X, window it, and report how many leading rows of X stay unscored."""
+        seq_len = self.params["seq_len"]
+        self._check_context(X, context)
+        ctx = context.tail(seq_len - 1) if context is not None and len(context) else None
+        full = pd.concat([ctx, X]) if ctx is not None else X
+        Xp = np.nan_to_num(self.pre_.transform(full).astype(np.float32), nan=0.0)
+        W = make_windows(Xp, seq_len)
+        n_ctx = 0 if ctx is None else len(ctx)
+        unscored = max(0, seq_len - 1 - n_ctx)
+        return W, unscored
+
+    def predict_proba(self, X: pd.DataFrame, context: pd.DataFrame | None = None) -> pd.DataFrame:
         self._check_fitted()
         self._check_columns(X)
-        seq_len = self.params["seq_len"]
-        Xp = np.nan_to_num(self.pre_.transform(X).astype(np.float32), nan=0.0)
-        W = make_windows(Xp, seq_len)
+        W, unscored = self._windows_with_context(X, context)
         out = pd.DataFrame(np.nan, index=X.index, columns=[int(c) for c in self.classes_], dtype=float)
         if len(W) == 0:
             return out
         with torch.no_grad():
             logits = self.net_(torch.tensor(W))
             proba = torch.softmax(logits, dim=1).numpy()
-        out.iloc[seq_len - 1 :, :] = proba
+        out.iloc[unscored:, :] = proba
         return out
+
+    def explain(self, X: pd.DataFrame, context: pd.DataFrame | None, background: pd.DataFrame, max_rows: int = 300) -> pd.DataFrame | None:
+        """Per-feature SHAP for X via GradientExplainer on the network's positive-class logit.
+
+        SHAP values are additive, so summing over the sequence axis gives a
+        legitimate per-feature attribution for each scored row.
+        """
+        import shap
+
+        W, unscored = self._windows_with_context(X, context)
+        if len(W) == 0:
+            return None
+        Wb, _ = self._windows_with_context(background, None)
+        if len(Wb) == 0:
+            return None
+        rng = np.random.default_rng(self.seed)
+        bg = Wb[rng.choice(len(Wb), size=min(64, len(Wb)), replace=False)]
+        W = W[-max_rows:]
+        cls_idx = int(np.searchsorted(self.classes_, 1)) if 1 in self.classes_ else len(self.classes_) - 1
+        net = self.net_.eval()
+
+        class _Head(nn.Module):
+            def __init__(self, inner: nn.Module) -> None:
+                super().__init__()
+                self.inner = inner
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.inner(x)[:, cls_idx : cls_idx + 1]
+
+        explainer = shap.GradientExplainer(_Head(net), torch.tensor(bg))
+        vals = explainer.shap_values(torch.tensor(W))
+        arr = vals[0] if isinstance(vals, list) else vals
+        arr = np.asarray(arr)
+        if arr.ndim == 4:  # (n, seq, f, 1)
+            arr = arr[..., 0]
+        per_feature = arr.sum(axis=1)  # collapse the time axis
+        rows = X.index[unscored:][-len(per_feature):]
+        return pd.DataFrame(per_feature, index=rows, columns=self.feature_names_)
 
     # torch modules pickle fine on CPU, but keep the device out of the file.
     def __getstate__(self) -> dict[str, Any]:
@@ -234,12 +284,12 @@ class TransformerAdapter(TorchSequenceAdapter):
         p = self.params
         return _Transformer(n_features, p["d_model"], p["n_heads"], p["n_layers"], p["dropout"], p["seq_len"], n_classes)
 
-    def param_distributions(self, rng: np.random.Generator) -> dict[str, Any]:
+    def suggest_params(self, trial: Any) -> dict[str, Any]:
         return {
-            "d_model": int(rng.choice([16, 32, 64])),
-            "n_layers": int(rng.integers(1, 4)),
-            "dropout": float(rng.choice([0.1, 0.2, 0.3])),
-            "lr": float(10 ** rng.uniform(-4, -2.5)),
+            "d_model": trial.suggest_categorical("d_model", [16, 32, 64]),
+            "n_layers": trial.suggest_int("n_layers", 1, 3),
+            "dropout": trial.suggest_categorical("dropout", [0.1, 0.2, 0.3]),
+            "lr": trial.suggest_float("lr", 1e-4, 3e-3, log=True),
         }
 
 

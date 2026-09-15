@@ -6,8 +6,13 @@ Contract:
   where the label is unusable (purged / warm-up). Adapters must skip those rows
   as targets and must never treat X contiguity as optional (sequence models
   need it).
-- predict_proba(X) returns a DataFrame indexed like X with one column per class
-  (the class labels themselves, ints). Rows the model cannot score are NaN.
+- predict_proba(X, context=None) returns a DataFrame indexed like X with one column
+  per class (the class labels themselves, ints). Rows the model cannot score are NaN.
+  `context` is an optional block of rows that immediately *precede* X in time
+  (same columns). Sequence models use it as history for the first windows so
+  every row of X gets a prediction; nothing is ever trained on it here, and it
+  is strictly in the past relative to X, so it is not a leak. Non-sequence
+  models ignore it.
 - Everything that fits (imputer, scaler, model) is fitted in fit() and only there.
 """
 
@@ -81,8 +86,11 @@ class ModelAdapter(ABC):
         return {"family": self.name, "seed": self.seed, "scaler": self.scaler, "imputer": self.imputer, **self.params}
 
     @abstractmethod
-    def param_distributions(self, rng: np.random.Generator) -> dict[str, Any]:
-        """One random hyperparameter draw, for per-fold re-tuning. Return {} to opt out."""
+    def suggest_params(self, trial: Any) -> dict[str, Any]:
+        """Optuna search space for per-fold re-tuning: call trial.suggest_* and return the draw.
+
+        Return {} to opt out (ensembles do). The keys must be names in param_schema.
+        """
 
     # -- core ---------------------------------------------------------------- #
     @abstractmethod
@@ -90,11 +98,11 @@ class ModelAdapter(ABC):
         ...
 
     @abstractmethod
-    def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
+    def predict_proba(self, X: pd.DataFrame, context: pd.DataFrame | None = None) -> pd.DataFrame:
         ...
 
-    def predict(self, X: pd.DataFrame) -> pd.Series:
-        proba = self.predict_proba(X)
+    def predict(self, X: pd.DataFrame, context: pd.DataFrame | None = None) -> pd.Series:
+        proba = self.predict_proba(X, context)
         out = pd.Series(np.nan, index=X.index)
         ok = proba.notna().all(axis=1)
         out[ok] = proba.loc[ok].idxmax(axis=1).astype(float)
@@ -128,6 +136,15 @@ class ModelAdapter(ABC):
     def _check_fitted(self) -> None:
         if not self.fitted_:
             raise RuntimeError(f"{self.name} has not been fitted. Call fit() first.")
+
+    @staticmethod
+    def _check_context(X: pd.DataFrame, context: pd.DataFrame | None) -> None:
+        if context is None or len(context) == 0:
+            return
+        if list(context.columns) != list(X.columns):
+            raise ValueError("context columns differ from X columns.")
+        if len(X) and context.index[-1] >= X.index[0]:
+            raise ValueError("context must end strictly before X starts. That would be the future.")
 
     def _check_columns(self, X: pd.DataFrame) -> None:
         if list(X.columns) != self.feature_names_:

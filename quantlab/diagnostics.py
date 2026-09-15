@@ -3,10 +3,15 @@
 Permutation importance is computed *per fold on that fold's OOS block* with that
 fold's own model, then averaged. Importance computed in-sample tells you what
 the model memorised, which is a different question.
+
+SHAP covers every family: trees via TreeExplainer, logistic regression via
+LinearExplainer, the torch nets via GradientExplainer with the sequence axis
+summed out. Ensembles and meta-labeling are explained component by component.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -16,26 +21,37 @@ from sklearn.metrics import confusion_matrix, log_loss
 
 from quantlab.models.classical import SklearnAdapter
 from quantlab.models.meta import SIDE_COL
-from quantlab.pipeline import Dataset, WalkForwardResult
+from quantlab.pipeline import CONTEXT_BARS, Dataset, WalkForwardResult
+
+
+def _context_for(ds: Dataset, f: Any) -> pd.DataFrame:
+    te0 = ds.X.index.get_loc(f.test_start)
+    return ds.X.iloc[max(0, te0 - CONTEXT_BARS) : te0]
 
 
 def permutation_importance_oos(ds: Dataset, wf: WalkForwardResult, n_repeats: int = 5, seed: int = 0, max_folds: int | None = None) -> pd.DataFrame:
-    """Mean OOS log-loss increase when each feature is shuffled, per fold, averaged."""
+    """Mean OOS log-loss increase when each feature is shuffled, per fold, averaged.
+
+    The shuffle covers the test block *and* the pre-test context handed to
+    sequence models, so a feature cannot sneak back in through the history window.
+    """
     rng = np.random.default_rng(seed)
     folds = wf.folds if max_folds is None else wf.folds[-max_folds:]
     rows: dict[str, list[float]] = {c: [] for c in ds.feature_columns}
     for f in folds:
         X_te = ds.X.loc[f.test_start : f.test_end]
         y_te = ds.y.loc[f.test_start : f.test_end]
-        base = _fold_logloss(f.model, X_te, y_te)
+        ctx = _context_for(ds, f)
+        base = _fold_logloss(f.model, X_te, y_te, ctx)
         if not np.isfinite(base):
             continue
+        n_ctx = len(ctx)
         for col in ds.feature_columns:
             deltas = []
             for _ in range(n_repeats):
-                Xp = X_te.copy()
-                Xp[col] = rng.permutation(Xp[col].to_numpy())
-                ll = _fold_logloss(f.model, Xp, y_te)
+                full = pd.concat([ctx, X_te])
+                full[col] = rng.permutation(full[col].to_numpy())
+                ll = _fold_logloss(f.model, full.iloc[n_ctx:], y_te, full.iloc[:n_ctx])
                 if np.isfinite(ll):
                     deltas.append(ll - base)
             if deltas:
@@ -44,8 +60,8 @@ def permutation_importance_oos(ds: Dataset, wf: WalkForwardResult, n_repeats: in
     return out.sort_values("importance", ascending=False).reset_index(drop=True)
 
 
-def _fold_logloss(model: Any, X: pd.DataFrame, y: pd.Series) -> float:
-    proba = model.predict_proba(X)
+def _fold_logloss(model: Any, X: pd.DataFrame, y: pd.Series, ctx: pd.DataFrame | None = None) -> float:
+    proba = model.predict_proba(X, ctx)
     ok = proba.notna().all(axis=1) & y.notna()
     if ok.sum() < 10:
         return np.nan
@@ -56,27 +72,85 @@ def _fold_logloss(model: Any, X: pd.DataFrame, y: pd.Series) -> float:
     return float(log_loss(yv, proba.loc[ok, cls].to_numpy(), labels=cls))
 
 
-def shap_values_last_fold(ds: Dataset, wf: WalkForwardResult, max_rows: int = 500) -> tuple[pd.DataFrame, pd.DataFrame] | None:
-    """SHAP on the last fold's OOS block for tree models. Returns (shap_df, X_used) or None."""
+@dataclass
+class ShapBlock:
+    component: str  # which part of the model this explains
+    scale: str  # what the SHAP values are in: probability / log-odds / logit
+    values: pd.DataFrame  # rows x features
+    X: pd.DataFrame  # raw feature values on the same rows, for colouring
+
+
+def shap_last_fold(ds: Dataset, wf: WalkForwardResult, max_rows: int = 400) -> list[ShapBlock]:
+    """SHAP on the last fold's OOS block for every explainable component of the fitted model.
+
+    Trees -> TreeExplainer, logistic regression -> LinearExplainer, torch nets ->
+    GradientExplainer (summed over the sequence axis). Ensembles are explained
+    member by member because their members live on different output scales and
+    averaging log-odds with probabilities would be a lie with a colour bar.
+    """
     f = wf.folds[-1]
-    model = f.model
-    inner = getattr(model, "secondary", model)  # meta-labeling: explain the secondary
-    if not isinstance(inner, SklearnAdapter):
-        return None
-    est = inner.sklearn_estimator()
-    if not hasattr(est, "feature_importances_"):
-        return None  # not a tree model; SHAP's Linear explainer is a footnote here
+    X_te = ds.X.loc[f.test_start : f.test_end].drop(columns=[SIDE_COL], errors="ignore").tail(max_rows)
+    ctx = _context_for(ds, f).drop(columns=[SIDE_COL], errors="ignore")
+    X_bg = ds.X.loc[f.train_start : f.train_end].drop(columns=[SIDE_COL], errors="ignore")
+    blocks: list[ShapBlock] = []
+    _explain(f.model, "model", X_te, ctx, X_bg, blocks)
+    return blocks
+
+
+def _explain(adapter: Any, name: str, X_te: pd.DataFrame, ctx: pd.DataFrame, X_bg: pd.DataFrame, out: list[ShapBlock]) -> None:
+    from quantlab.models.deep import TorchSequenceAdapter
+    from quantlab.models.ensemble import StackingAdapter, VotingAdapter
+    from quantlab.models.meta import MetaLabelingAdapter
+
+    if isinstance(adapter, MetaLabelingAdapter):
+        if adapter.primary is not None:
+            _explain(adapter.primary, f"{name}.primary", X_te, ctx, X_bg, out)
+        _explain(adapter.secondary, f"{name}.secondary", X_te, ctx, X_bg, out)
+        return
+    if isinstance(adapter, (VotingAdapter, StackingAdapter)):
+        for m in adapter.members:
+            _explain(m, f"{name}.{m.name}", X_te, ctx, X_bg, out)
+        return
+    if isinstance(adapter, TorchSequenceAdapter):
+        vals = adapter.explain(X_te, ctx, X_bg)
+        if vals is not None:
+            out.append(ShapBlock(f"{name} ({adapter.name})", "logit of P(+1), summed over the sequence", vals, X_te.loc[vals.index]))
+        return
+    if isinstance(adapter, SklearnAdapter):
+        blk = _explain_sklearn(adapter, name, X_te, X_bg)
+        if blk is not None:
+            out.append(blk)
+
+
+def _explain_sklearn(adapter: SklearnAdapter, name: str, X_te: pd.DataFrame, X_bg: pd.DataFrame) -> ShapBlock | None:
     import shap
 
-    X_te = ds.X.loc[f.test_start : f.test_end].drop(columns=[SIDE_COL], errors="ignore").tail(max_rows)
-    Xt = inner.transform_features(X_te)
-    explainer = shap.TreeExplainer(est)
-    vals = explainer.shap_values(Xt)
+    est = adapter.sklearn_estimator()
+    Xt = adapter.transform_features(X_te)
+    cols = adapter.feature_names_
+    pos = int(np.searchsorted(adapter.classes_, 1)) if 1 in adapter.classes_ else len(adapter.classes_) - 1
+    if hasattr(est, "feature_importances_"):
+        vals = shap.TreeExplainer(est).shap_values(Xt)
+        kind = type(est).__name__
+        scale = "probability of +1" if kind.endswith(("ForestClassifier", "TreesClassifier")) else "log-odds of +1"
+    elif hasattr(est, "coef_"):
+        bg = adapter.transform_features(X_bg.tail(1000))
+        vals = shap.LinearExplainer(est, bg).shap_values(Xt)
+        scale = "log-odds of +1"
+    else:
+        return None
+    arr = _pick_class(vals, pos)
+    return ShapBlock(f"{name} ({adapter.name})", scale, pd.DataFrame(arr, index=X_te.index, columns=cols), X_te)
+
+
+def _pick_class(vals: Any, pos: int) -> np.ndarray:
+    """shap returns a list (per class), a 3-D array (n, f, classes) or a 2-D array. Normalise."""
     if isinstance(vals, list):
-        vals = vals[-1]  # positive class for binary; last class otherwise
-    elif vals.ndim == 3:
-        vals = vals[:, :, -1]
-    return pd.DataFrame(vals, index=X_te.index, columns=inner.feature_names_), pd.DataFrame(Xt, index=X_te.index, columns=inner.feature_names_)
+        return np.asarray(vals[pos] if len(vals) > pos else vals[-1])
+    arr = np.asarray(vals)
+    if arr.ndim == 3:
+        return arr[:, :, min(pos, arr.shape[2] - 1)]
+    return arr
 
 
 def confusion(wf: WalkForwardResult) -> pd.DataFrame:

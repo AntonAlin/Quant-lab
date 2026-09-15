@@ -13,3 +13,4 @@ streamlit==1.49.1
 yfinance==0.2.66
 torch==2.8.0
 pytest==8.4.1
+optuna==4.5.0

@@ -197,7 +197,7 @@ def regime_bars(df: pd.DataFrame) -> go.Figure:
     return _base(fig, "Sharpe per regime (OOS)", 380)
 
 
-def shap_beeswarm(shap_df: pd.DataFrame, X: pd.DataFrame, top: int = 15) -> go.Figure:
+def shap_beeswarm(shap_df: pd.DataFrame, X: pd.DataFrame, top: int = 15, scale: str = "model output") -> go.Figure:
     order = shap_df.abs().mean().sort_values(ascending=False).index[:top]
     fig = go.Figure()
     for i, c in enumerate(order[::-1]):
@@ -205,7 +205,7 @@ def shap_beeswarm(shap_df: pd.DataFrame, X: pd.DataFrame, top: int = 15) -> go.F
         col = (xv - xv.min()) / (xv.max() - xv.min() + 1e-12)
         fig.add_trace(go.Scatter(x=shap_df[c], y=np.full(len(shap_df), i) + np.random.uniform(-0.25, 0.25, len(shap_df)), mode="markers", name=c, marker=dict(color=col, colorscale="RdBu_r", size=5, opacity=0.6, showscale=(i == 0)), showlegend=False))
     fig.update_yaxes(tickvals=list(range(len(order))), ticktext=list(order[::-1]))
-    fig.update_layout(hovermode="closest", xaxis_title="SHAP value (impact on P(positive class))")
+    fig.update_layout(hovermode="closest", xaxis_title=f"SHAP value (impact on {scale})")
     return _base(fig, "SHAP (last fold, OOS)", max(380, 26 * len(order) + 120))
 
 
