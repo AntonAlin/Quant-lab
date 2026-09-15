@@ -45,6 +45,8 @@ python scripts/make_shortcut.py
 
 It creates `QuantLab.lnk` (Windows), `QuantLab.command` (macOS) or `QuantLab.desktop` (Linux) on your desktop, pointing at the launcher above.
 
+**Notebook instead of the app:** `notebooks/quantlab_walkthrough.ipynb` runs the same pipeline cell by cell (data, features, labels, walk-forward, backtest, DSR, SHAP, log, leaderboard, PBO). Its first cell clones the repo and installs missing packages, so it works as-is in Google Colab or Microsoft Fabric; locally, open it from the repo root with the venv active. If Yahoo is unreachable it falls back to synthetic data, says so, and refuses to write synthetic runs to the experiment log.
+
 Tests:
 
 ```bash
